@@ -11,7 +11,7 @@ val ktorVersion = extra["ktor.version"] as String
 val exposedVersion = extra["exposed.version"] as String
 
 group = "top.kagg886.cctr"
-version = "1.0-SNAPSHOT"
+version = providers.gradleProperty("app.version").get()
 
 repositories {
     mavenCentral()
@@ -28,6 +28,7 @@ dependencies {
 
     testImplementation(kotlin("test"))
     implementation("com.itextpdf:itext7-core:8.0.4")
+    implementation("org.jsoup:jsoup:1.17.2")
 
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
     implementation("moe.tlaster:precompose:1.6.0")
@@ -52,7 +53,8 @@ kotlin {
 tasks.jar {
     manifest {
         attributes(
-            "Main-Class" to "top.kagg886.cctr.desktop.MainKt"
+            "Main-Class" to "top.kagg886.cctr.desktop.MainKt",
+            "Implementation-Version" to project.version.toString()
         )
     }
 }
@@ -60,12 +62,17 @@ tasks.jar {
 compose.desktop {
     application {
         mainClass = "top.kagg886.cctr.desktop.MainKt"
+        providers.gradleProperty("packaging.javaHome").orNull?.let { javaHome = it }
 
         nativeDistributions {
             targetFormats(TargetFormat.Exe, TargetFormat.AppImage)
             packageName = "CCTRCloudExportDesktop"
-            packageVersion = "1.0.0"
+            packageVersion = project.version.toString()
             includeAllModules = true
+            windows {
+                shortcut = true
+                menu = true
+            }
             buildTypes {
                 release {
                     proguard {

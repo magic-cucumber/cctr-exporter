@@ -7,18 +7,18 @@ import top.kagg886.cctr.api.modules.QueryModel
 import top.kagg886.cctr.api.modules.queryQuestionList
 import top.kagg886.cctr.backend.dao.Task
 import top.kagg886.cctr.backend.dao.Tasks
-import top.kagg886.cctr.backend.dao.Tasks.ExportType.IMG
 import top.kagg886.cctr.backend.dao.Tasks.ExportType.PDF
 import top.kagg886.cctr.backend.service.TaskService
 import top.kagg886.cctr.backend.util.error
 import top.kagg886.cctr.backend.util.info
+import top.kagg886.cctr.backend.util.warnAndSave
 import top.kagg886.cctr.desktop.trayChannel
-import top.kagg886.cctr.desktop.util.convertToPDF
+import top.kagg886.cctr.desktop.util.PdfExportDetails
 import top.kagg886.cctr.desktop.util.root_file
 import top.kagg886.cctr.driver.WebDriverDispatcher
+import top.kagg886.cctr.driver.capturePdfAsset
 import top.kagg886.cctr.driver.captchaImage
 import top.kagg886.cctr.util.mergeVertical
-import top.kagg886.cctr.util.useTempDictionary
 import top.kagg886.cctr.util.useTempDictionarySuspend
 import top.kagg886.cctr.util.zip
 import java.awt.image.BufferedImage
@@ -58,7 +58,10 @@ object TaskManager {
         }
     }
 
-    suspend fun commitTask(vm: Task): Task {
+    suspend fun commitTask(vm: Task, client: CCTRUser): Task {
+        require(vm.schoolId == client.schoolId && vm.username == client.userName && vm.password == client.passWord) {
+            "任务账号与当前登录会话不一致，请重新登录"
+        }
         val dbTask = checkNotNull(
             TaskService.insert(
                 Task(
@@ -76,28 +79,26 @@ object TaskManager {
             "添加任务失败"
         }
         dbTask.info("成功添加任务记录")
-        submitTask(task = dbTask)
         dbTask.info("任务已进入队列")
+        submitTask(task = dbTask, client = client)
         return dbTask
     }
 
-    private fun submitTask(task: Task) = dispatcher.launch {
-        check(task.id != -1) {
-            "请规范化taskId!"
-        }
-        check(TaskService.update(task.copy(status = Tasks.TaskStatus.PROCESSING))) {
-            "修改数据库内任务状态失败!"
-        }
+    private fun submitTask(task: Task, client: CCTRUser? = null) = dispatcher.launch {
+        val progressChannel = Channel<Int>()
+        var skippedPdfCount = 0
         try {
-            task.info("任务开始执行")
-            task.info("准备登陆")
-            val cctr = CCTRUser.newCCTRUser {
-                schoolId = task.schoolId
-                username = task.username
-                password = task.password
+            check(task.id != -1) {
+                "请规范化taskId!"
             }
-            cctr.init()
-            task.info("登录成功")
+            check(TaskService.update(task.copy(status = Tasks.TaskStatus.PROCESSING))) {
+                "修改数据库内任务状态失败!"
+            }
+            task.info("任务开始执行")
+            val cctr = checkNotNull(client) {
+                "登录会话已失效，请点击重试并输入验证码重新登录"
+            }
+            task.info("使用已验证的登录会话")
 
             val questions = buildMap big@{
                 task.config.filter { (_, map) -> map.isNotEmpty() }.map { (pr, map) ->
@@ -124,7 +125,7 @@ object TaskManager {
             }
             val all = questions.toMap().flatMap { it.value.flatMap { it1 -> it1.value } }.size
             task.info("查询需要导出的题目成功，共${all}个")
-            val progressChannel = Channel<Int>()
+            if (task.exportType == PDF) check(all > 0) { "没有可导出的题目" }
             var progress = 0
             val percentArr = (1..10).map {
                 (all / 10) * it
@@ -142,7 +143,23 @@ object TaskManager {
                     }
                 }
             }
-            useTempDictionarySuspend { root ->
+            val archive = root_file.resolve("out").resolve("task_${task.id}.zip")
+            if (task.exportType == PDF) {
+                val groups = questions.flatMap { (practice, chapters) ->
+                    chapters.flatMap { (chapter, chapterQuestions) ->
+                        chapterQuestions.groupBy { it.questionType.trim() }.map { (type, group) ->
+                            PdfExportDetails(practice.practiceName.trim(), chapter.name.trim(), type) to group
+                        }
+                    }
+                }
+                skippedPdfCount = writeQuestionPdfArchive(
+                    archive,
+                    groups,
+                    onGroupProcessed = { count -> repeat(count) { progressChannel.send(0) } },
+                    reportSkipped = task::warnAndSave,
+                    renderComplex = { fragment -> WebDriverDispatcher.useDriver { it.capturePdfAsset(fragment) } },
+                )
+            } else useTempDictionarySuspend { root ->
                 //download image
                 questions.map { (pr, map) ->
                     async(Dispatchers.IO) {
@@ -214,51 +231,9 @@ object TaskManager {
                     }
                 }.awaitAll()
 
-                when (task.exportType) {
-                    PDF -> {
-                        //root/练习名/章节名/题型名/图片
-                        useTempDictionary { tmp ->
-                            for (prFile in root.listFiles()!!) { //练习名
-                                for (cpFile in prFile.listFiles()!!) { //章节名
-                                    for (qFile in cpFile.listFiles()!!) { //题型名
-                                        qFile.listFiles()!!.toList().convertToPDF(
-                                            tmp.resolve(prFile.name).resolve(cpFile.name).resolve(qFile.name + ".pdf")
-                                                .apply {
-                                                    parentFile.mkdirs()
-                                                    createNewFile()
-                                                }
-                                        )
-                                    }
-                                }
-                            }
-                            tmp.zip(
-                                out = root_file.resolve("out").resolve("task_" + task.id.toString() + ".zip")
-                                    .apply {
-                                        if (exists()) {
-                                            delete()
-                                        }
-                                        parentFile.mkdirs()
-                                        createNewFile()
-                                    }
-                            )
-                        }
-                    }
-
-                    IMG -> {
-                        root.zip(
-                            out = root_file.resolve("out").resolve("task_" + task.id.toString() + ".zip")
-                                .apply {
-                                    if (exists()) {
-                                        delete()
-                                    }
-                                    parentFile.mkdirs()
-                                    createNewFile()
-                                }
-                        )
-                    }
-                }
+                archive.parentFile.mkdirs()
+                root.zip(archive)
             }
-            progressChannel.close()
         } catch (e: Throwable) {
             e.printStackTrace()
             task.error("任务执行失败:${e::class.jvmName} ${e.message}")
@@ -267,9 +242,14 @@ object TaskManager {
             }
             trayChannel.send("任务id:${task.id}执行失败，原因请打开对应任务日志查看")
             return@launch
+        } finally {
+            progressChannel.close()
+            client?.close()
         }
         check(TaskService.update(task.copy(status = Tasks.TaskStatus.SUCCESS)))
         task.info("任务记录更新成功")
-        trayChannel.send("任务id:${task.id}执行成功")
+        val result = if (skippedPdfCount == 0) "执行成功"
+            else "部分导出完成，${skippedPdfSummary(skippedPdfCount)}"
+        trayChannel.send("任务id:${task.id}$result")
     }
 }
