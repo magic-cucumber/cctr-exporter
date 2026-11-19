@@ -42,38 +42,112 @@ internal class PdfHtmlContent(
     private val width: Float,
     private val renderComplex: suspend (String) -> CapturedPdfAsset,
 ) {
-    private val checkedGlyphs = mutableSetOf<Int>()
+    private val fonts = PdfFontResolver(font)
+    var sourceStage: String = "文档信息"
 
-    fun pdfText(value: String): Text {
-        value.codePoints().forEach { point ->
-            if (!Character.isISOControl(point) && checkedGlyphs.add(point)) {
-                require(font.containsGlyph(point)) { "PDF 字体不支持 U+${point.toString(16).uppercase()}" }
-                val glyph = font.fontProgram.getGlyphByCode(font.getGlyph(point).code)
-                // The bundled font shares some Han glyphs with radicals. Keep the ordinary Han
-                // character in this document's ToUnicode map, independent of other exports.
-                if (glyph != null && point in 0x3400..0x9FFF && glyph.unicode != point) {
-                    glyph.setChars(Character.toChars(point))
-                }
+    internal data class PdfTextRun(val font: PdfFont, val text: String, val bold: Boolean, val italic: Boolean)
+
+    /** Split plain text into font runs; used by headings, answers, canvas furniture and fit(). */
+    fun runs(value: String, bold: Boolean = false, italic: Boolean = false): List<PdfTextRun> {
+        val text = value.pdfLtrText(sourceStage)
+        text.validatePdfJoiningContext(sourceStage)
+        val result = mutableListOf<PdfTextRun>()
+        val buffer = StringBuilder()
+        val pendingControls = StringBuilder()
+        var current: PdfFont? = null
+        fun flush() {
+            if (buffer.isNotEmpty() && current != null) {
+                result += PdfTextRun(current!!, buffer.toString(), bold, italic)
+                buffer.setLength(0)
             }
         }
-        return Text(value).setFont(font)
+        text.codePoints().forEach { point ->
+            if (isPdfZeroWidthControl(point)) {
+                // Leading controls attach to the next visible glyph, trailing ones stay in the run.
+                if (current == null || buffer.isEmpty()) pendingControls.appendCodePoint(point)
+                else buffer.appendCodePoint(point)
+                return@forEach
+            }
+            val selected = if (Character.isISOControl(point)) font else when (val route = fonts.route(point, null, sourceStage, bold, italic)) {
+                is GlyphRoute.Native -> route.font
+                GlyphRoute.SourceGlyph -> throw PdfSourceFont(null, "未声明").error(point, sourceStage, "纯文本缺少来源字体")
+                is GlyphRoute.Unsupported -> throw PdfSourceFont(null, "未声明")
+                    .error(point, sourceStage, "已尝试=${route.attempts.joinToString("、")}")
+            }
+            if (selected !== current) {
+                flush()
+                current = selected
+                buffer.append(pendingControls)
+                pendingControls.setLength(0)
+            }
+            buffer.appendCodePoint(point)
+        }
+        flush()
+        return result
+    }
+
+    fun appendRuns(target: Paragraph, value: String, bold: Boolean = false, italic: Boolean = false) {
+        for (run in runs(value, bold, italic)) {
+            val text = nativeText(run.text, run.font)
+            if (run.bold && (run.font === font || fonts.isFallback(run.font))) text.setBold()
+            // Synthetic italic on a fallback run shifts the following run and leaks a space into
+            // extraction; symbol fonts keep their regular slant instead.
+            if (run.italic && run.font === font) text.setItalic()
+            target.add(text)
+        }
+    }
+
+    private fun nativeText(value: String, selected: PdfFont): Text {
+        value.codePoints().forEach { point ->
+            if (isPdfZeroWidthControl(point) || Character.isISOControl(point)) return@forEach
+            if (!selected.containsGlyph(point)) {
+                throw PdfSourceFont(null, "未声明").error(point, sourceStage, "字体路由未覆盖")
+            }
+            val glyph = selected.fontProgram.getGlyphByCode(selected.getGlyph(point).code)
+            // Shared glyphs lose their ToUnicode identity in a subset. The bundled font already
+            // corrects Han radicals; fallback fonts need the same treatment for every code point.
+            if (glyph != null && glyph.unicode != point && (selected !== font || point in 0x3400..0x9FFF)) {
+                glyph.setChars(Character.toChars(point))
+            }
+        }
+        return formatControlText(value, selected)
     }
 
     suspend fun addHtml(html: String, emit: (IBlockElement) -> Unit) =
         addNodes(Jsoup.parseBodyFragment(html).body().childNodes(), emit)
 
     suspend fun addNodes(nodes: List<Node>, emit: (IBlockElement) -> Unit, label: String = "", availableWidth: Float = width) {
+        fun visibleText(node: Node): String = when (node) {
+            is TextNode -> node.wholeText
+            is Element -> if (node.isHiddenPdfContent()) "" else node.childNodes().joinToString("") { visibleText(it) }
+            else -> ""
+        }
+        nodes.joinToString("") { visibleText(it) }.validatePdfJoiningContext(sourceStage)
+        fun visibleTextNodes(node: Node): List<TextNode> = when (node) {
+            is TextNode -> listOf(node)
+            is Element -> if (node.isHiddenPdfContent()) emptyList() else node.childNodes().flatMap(::visibleTextNodes)
+            else -> emptyList()
+        }
+        val firstText = nodes.flatMap(::visibleTextNodes).firstOrNull { it.wholeText.isNotBlank() }
+        val styles = nodes.firstOrNull()?.ownerDocument()?.select("style")?.joinToString("\n") { it.data() }.orEmpty()
+        if (directionDeclaration.findAll(styles).any { match ->
+                match.groupValues[2].trim().removeSuffix("!important").trim().lowercase() !in setOf("ltr", "normal")
+            }) {
+            throw PdfContentNotSupportedException("PDF 暂不支持双向文本；阶段=$sourceStage；来源=方向样式规则")
+        }
         var paragraph = paragraph()
         var hasContent = false
         var pendingLabel = label
         var previousSpace = false
         var lineHasText = false
         var hasAlignedFormula = false
+        var lastNative: Triple<Text, String, PdfFont>? = null
+        var pendingFormatControls = ""
         val lineFormulas = mutableListOf<InlinePdfImage>()
 
         fun start() {
             if (pendingLabel.isNotEmpty()) {
-                paragraph.add(pdfText(pendingLabel).setBold())
+                appendRuns(paragraph, pendingLabel, bold = true)
                 pendingLabel = ""
                 previousSpace = true
                 lineHasText = true
@@ -90,9 +164,13 @@ internal class PdfHtmlContent(
             }
             lineFormulas.clear()
             lineHasText = false
+            lastNative = null
         }
 
         fun flush() {
+            if (pendingFormatControls.isNotEmpty()) {
+                throw PdfContentNotSupportedException("零宽格式控制没有可附着的可见文字；阶段=$sourceStage")
+            }
             finishLine()
             if (hasAlignedFormula) paragraph.setProperty(Property.RENDERING_MODE, RenderingMode.HTML_MODE)
             if (hasContent) emit(paragraph)
@@ -105,19 +183,97 @@ internal class PdfHtmlContent(
         suspend fun visit(node: Node, format: InlineFormat) {
             when (node) {
                 is TextNode -> {
-                    var value = node.wholeText
+                    var value = node.wholeText.pdfLtrText(sourceStage)
                     if (!format.preformatted) {
                         value = htmlSpaces.replace(value, " ")
                         if (!hasContent || previousSpace) value = value.trimStart(' ')
                     }
                     if (value.isEmpty()) return
+                    value.forEachIndexed { index, character ->
+                        if (character == '\u2060' || character == '\uFEFF') {
+                            val attachable = (index > 0 && index < value.lastIndex) ||
+                                (character == '\uFEFF' && index == 0 && node === firstText)
+                            if (!attachable) {
+                                throw PdfContentNotSupportedException(
+                                    "PDF 尚不支持跨文字节点的禁止换行控制；阶段=$sourceStage；码点=U+${character.code.toString(16).uppercase()}",
+                                )
+                            }
+                        }
+                    }
+                    if (value.codePoints().allMatch { isPdfZeroWidthControl(it) }) {
+                        val preceding = lastNative
+                        if (preceding != null) {
+                            val logical = preceding.second + value
+                            formatControlText(logical, preceding.third, preceding.first)
+                            lastNative = Triple(preceding.first, logical, preceding.third)
+                        } else pendingFormatControls += value
+                        return
+                    }
                     start()
-                    val run = pdfText(value)
-                    if (format.bold) run.setBold()
-                    if (format.italic) run.setItalic()
-                    if (format.underline) run.setUnderline()
-                    if (format.rise != 0f) run.setTextRise(format.rise).setFontSize(8.5f)
-                    paragraph.add(run)
+                    val source = PdfSourceFont.from(node)
+                    val mapped = value.codePoints().toArray().map(source::mapSymbol)
+                    var native = StringBuilder()
+                    var runFont = font
+                    var noBreakNext = false
+                    var sourceRun = StringBuilder()
+                    fun flushNative() {
+                        if (native.isEmpty()) return
+                        val logical = pendingFormatControls + native.toString()
+                        pendingFormatControls = ""
+                        val run = nativeText(logical, runFont)
+                        if (format.bold && (runFont === font || fonts.isFallback(runFont))) run.setBold()
+                        // Synthetic italic on a fallback run shifts the following run and leaks a
+                        // space into extraction; symbol fonts keep their regular slant instead.
+                        if (format.italic && runFont === font) run.setItalic()
+                        if (format.underline) run.setUnderline()
+                        if (format.rise != 0f) run.setTextRise(format.rise).setFontSize(8.5f)
+                        paragraph.add(run)
+                        lastNative = Triple(run, logical, runFont)
+                        native = StringBuilder()
+                    }
+                    suspend fun flushSource() {
+                        if (sourceRun.isEmpty()) return
+                        val asset = renderSourceGlyph(sourceRun.toString(), source, format, availableWidth)
+                        if (pendingFormatControls.isNotEmpty()) {
+                            throw PdfContentNotSupportedException("无法验证图片前的零宽格式控制；阶段=$sourceStage")
+                        }
+                        lineFormulas.add(asset)
+                        paragraph.add(asset.image)
+                        lastNative = null
+                        sourceRun = StringBuilder()
+                    }
+                    for (point in mapped) {
+                        if ((point == 0x2060 || point == 0xFEFF) && sourceRun.isNotEmpty()) {
+                            throw PdfContentNotSupportedException("PDF 尚不支持跨字体或图片的禁止换行控制；阶段=$sourceStage")
+                        }
+                        val selected = when {
+                            isPdfZeroWidthControl(point) -> runFont
+                            Character.getType(point) == Character.PRIVATE_USE.toInt() -> null
+                            else -> when (val route = fonts.route(point, source, sourceStage, format.bold, format.italic)) {
+                                is GlyphRoute.Native -> route.font
+                                GlyphRoute.SourceGlyph -> null
+                                is GlyphRoute.Unsupported -> throw source.error(
+                                    point, sourceStage, "已尝试=${route.attempts.joinToString("、")}",
+                                )
+                            }
+                        }
+                        if (noBreakNext && !isPdfZeroWidthControl(point) && (selected == null || selected !== runFont)) {
+                            throw PdfContentNotSupportedException("PDF 尚不支持跨字体或图片的禁止换行控制；阶段=$sourceStage")
+                        }
+                        if (selected != null) {
+                            flushSource()
+                            if (selected !== runFont) flushNative()
+                            runFont = selected
+                            native.appendCodePoint(point)
+                        } else {
+                            flushNative()
+                            sourceRun.appendCodePoint(point)
+                        }
+                        if (point == 0x2060 || point == 0xFEFF) noBreakNext = true
+                        else if (!isPdfZeroWidthControl(point)) noBreakNext = false
+                    }
+                    flushSource()
+                    flushNative()
                     if (format.preformatted && '\n' in value) {
                         lineHasText = lineHasText || value.substringBefore('\n').hasVisiblePdfText()
                         finishLine()
@@ -129,18 +285,27 @@ internal class PdfHtmlContent(
                 }
                 is Element -> {
                     if (node.isHiddenPdfContent()) return
+                    if (node.attr("dir").equals("rtl", true) || directionDeclaration.findAll(node.attr("style")).any { match ->
+                            match.groupValues[2].trim().removeSuffix("!important").trim().lowercase() !in setOf("ltr", "normal")
+                        }) {
+                        throw PdfContentNotSupportedException("PDF 暂不支持双向文本；阶段=$sourceStage；来源=方向样式")
+                    }
                     when (val name = node.normalName()) {
                         "br" -> {
                             start()
                             finishLine()
-                            paragraph.add(pdfText("\n"))
+                            appendRuns(paragraph, "\n")
                             previousSpace = true
                         }
                         "img", "svg", "math" -> {
+                            if (pendingFormatControls.isNotEmpty()) {
+                                throw PdfContentNotSupportedException("无法验证图片前的零宽格式控制；阶段=$sourceStage")
+                            }
                             start()
                             val asset = image(node, availableWidth)
                             if (asset.baselineFraction != 0f) lineFormulas.add(asset)
                             paragraph.add(asset.image)
+                            lastNative = null
                             previousSpace = false
                         }
                         "table" -> {
@@ -183,6 +348,31 @@ internal class PdfHtmlContent(
     }
 
     private fun paragraph() = Paragraph().setMultipliedLeading(1.35f).setMarginTop(0f).setMarginBottom(5f)
+
+    private suspend fun renderSourceGlyph(
+        value: String,
+        source: PdfSourceFont,
+        format: InlineFormat,
+        availableWidth: Float,
+    ): InlinePdfImage {
+        val points = value.codePoints().toArray()
+        val family = source.verifiedBrowserFamily(points, sourceStage)
+        val fontSize = if (format.rise == 0f) 11f else 8.5f
+        val glyph = Element("span").attr("data-cctr-font-family", family)
+            .attr("data-cctr-pdf-max-css-width", (availableWidth / pointsPerCssPixel).toString())
+            .attr("style", "font-family:'$family';font-size:${fontSize / pointsPerCssPixel}px;" +
+                "font-weight:${if (format.bold) "bold" else "normal"};font-style:${if (format.italic) "italic" else "normal"};white-space:pre")
+            .text(value)
+        if (format.underline) glyph.attr("style", glyph.attr("style") + ";text-decoration:underline")
+        val marker = Element("span").attr("data-cctr-font-baseline", "")
+            .attr("style", "display:inline-block;width:0;height:0")
+        val rendered = capture(glyph.outerHtml() + marker.outerHtml())
+        val baseline = rendered.baselineFromBottomCssPixels
+            ?: throw source.error(points.first(), sourceStage, "局部字形缺少可验证基线")
+        val bytes = ByteArrayOutputStream().also { check(ImageIO.write(rendered.image, "PNG", it)) }.toByteArray()
+        val image = sizeImage(Image(ImageDataFactory.create(bytes)), rendered.cssWidth * pointsPerCssPixel, availableWidth)
+        return InlinePdfImage(image, (format.rise / pointsPerCssPixel * rendered.sourceCssScale - baseline) / rendered.cssHeight)
+    }
 
     private suspend fun table(source: Element, availableWidth: Float): IBlockElement {
         val rows = source.select("tr").asSequence().filter { it.closest("table") === source }.toList()
@@ -266,11 +456,12 @@ internal class PdfHtmlContent(
                 element.attr("src", url.toString())
             }
         }
-        val rendered = renderComplex(element.outerHtml())
+        element.attr("data-cctr-pdf-max-css-width", (availableWidth / pointsPerCssPixel).toString())
+        val rendered = capture(element.outerHtml())
         val bytes = ByteArrayOutputStream().also { check(ImageIO.write(rendered.image, "PNG", it)) }.toByteArray()
         val image = sizeImage(Image(ImageDataFactory.create(bytes)), rendered.cssWidth * pointsPerCssPixel, availableWidth)
         return element.alignFormula(
-            image, svgSource, rendered.cssHeight.toFloat(), rendered.contentHeightCssPixels, rendered.bottomInsetCssPixels,
+            image, svgSource, rendered.cssHeight.toFloat(), rendered.contentHeightCssPixels, rendered.bottomInsetCssPixels, rendered.sourceCssScale,
         )
     }
 
@@ -283,6 +474,7 @@ internal class PdfHtmlContent(
         cssHeight: Float,
         contentHeight: Float = cssHeight,
         bottomInset: Float = 0f,
+        sourceCssScale: Float = 1f,
     ): InlinePdfImage {
         val wrapper = parent()?.takeIf { it.normalName() == "span" && it.childrenSize() == 1 && !it.ownText().hasVisiblePdfText() }
         if (attr("display").equals("block", ignoreCase = true) ||
@@ -297,7 +489,7 @@ internal class PdfHtmlContent(
             return InlinePdfImage(image)
         }
         val sourceOffset = if (declaration != null) {
-            cssOffset?.takeIf { it in -contentHeight..contentHeight } ?: 0f
+            cssOffset?.times(sourceCssScale)?.takeIf { it in -contentHeight..contentHeight } ?: 0f
         } else {
             if (wiris) wirisBaselineFraction(svgSource.orEmpty()) * contentHeight else 0f
         }
@@ -312,6 +504,16 @@ internal class PdfHtmlContent(
         val scale = minOf(preferredWidth / originalWidth, availableWidth / originalWidth, 650f / originalHeight)
         return image.scaleAbsolute(originalWidth * scale, originalHeight * scale)
             .setMaxWidth(UnitValue.createPercentValue(100f))
+    }
+
+    private suspend fun capture(fragment: String): CapturedPdfAsset = try {
+        renderComplex(fragment)
+    } catch (error: kotlinx.coroutines.CancellationException) {
+        throw error
+    } catch (error: IllegalArgumentException) {
+        throw IllegalArgumentException("${error.message}；阶段=$sourceStage", error)
+    } catch (error: IllegalStateException) {
+        throw IllegalStateException("${error.message}；阶段=$sourceStage", error)
     }
 
     private fun decodeDataImage(uri: String): ByteArray {
@@ -351,9 +553,12 @@ internal class PdfHtmlContent(
         fun with(element: Element): InlineFormat {
             val tag = element.normalName()
             val style = element.attr("style").lowercase().replace(" ", "")
+            val weight = Regex("(?:^|;)font-weight:([^;]+)").findAll(style).lastOrNull()?.groupValues?.get(1)?.removeSuffix("!important")
+            val slant = Regex("(?:^|;)font-style:([^;]+)").findAll(style).lastOrNull()?.groupValues?.get(1)?.removeSuffix("!important")
             return InlineFormat(
-                bold || tag in setOf("strong", "b", "h1", "h2", "h3", "h4") || "font-weight:bold" in style,
-                italic || tag in setOf("em", "i") || "font-style:italic" in style,
+                when { weight in setOf("normal", "400") -> false; weight in setOf("bold", "600", "700", "800", "900") -> true
+                    else -> bold || tag in setOf("strong", "b", "h1", "h2", "h3", "h4") },
+                when { slant == "normal" -> false; slant in setOf("italic", "oblique") -> true; else -> italic || tag in setOf("em", "i") },
                 underline || tag == "u" || "text-decoration:underline" in style,
                 when (tag) { "sup" -> 3.5f; "sub" -> -2.5f; else -> rise },
                 preformatted || tag == "pre",
@@ -448,6 +653,7 @@ private fun Element.isHiddenPdfContent(): Boolean =
 
 private val htmlSpaces = Regex("[ \\t\\n\\r\\u000c]+")
 private val hiddenStyle = Regex("(?i)(?:^|;)\\s*(?:display\\s*:\\s*none|visibility\\s*:\\s*hidden)\\b")
+private val directionDeclaration = Regex("(?i)(direction|unicode-bidi)\\s*:\\s*([^;}]+)")
 private val nonRenderedTags = setOf("script", "style", "template", "noscript")
 private val blockTags = setOf("p", "div", "section", "article", "blockquote", "pre", "li", "h1", "h2", "h3", "h4", "h5", "h6")
 private val vectorShapes = setOf("path", "line", "polyline", "polygon", "rect", "circle", "ellipse")
